@@ -11,6 +11,8 @@
     <description>Soak Tests for Hazelcast Jet</description>
     <modules>
         <module>kafka-test</module>
+        <module>broadcast-ssl-test</module>
+        <module>wordcount-ssl-test</module>
         <module>kafka-long-running-test</module>
         <module>kafka-long-running-session-window-test</module>
         <module>hdfs-test</module>
