@@ -17,12 +17,13 @@
 package tests.eventjournal;
 
 import com.hazelcast.client.proxy.ClientMapProxy;
-import com.hazelcast.core.ICompletableFuture;
+import com.hazelcast.core.ExecutionCallback;
+import com.hazelcast.core.OperationTimeoutException;
+import com.hazelcast.jet.impl.util.ExceptionUtil;
 import com.hazelcast.map.journal.EventJournalMapEvent;
 import com.hazelcast.ringbuffer.ReadResultSet;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 
@@ -32,31 +33,55 @@ public class EventJournalConsumer<K, V> {
 
     private final ClientMapProxy<K, V> proxy;
     private final int partitionCount;
-    private final long[] offsets;
+    private AtomicReference<Throwable> failure;
 
-    public EventJournalConsumer(ClientMapProxy<K, V> proxy, int partitionCount) {
+    public EventJournalConsumer(ClientMapProxy<K, V> proxy, int partitionCount, AtomicReference<Throwable> failure) {
         this.proxy = proxy;
         this.partitionCount = partitionCount;
-        offsets = new long[partitionCount];
+        this.failure = failure;
     }
 
-    public boolean drain(Consumer<EventJournalMapEvent<K, V>> consumer) throws Exception {
-        boolean isEmpty = true;
-        List<ICompletableFuture<ReadResultSet<EventJournalMapEvent<K, V>>>> futureList = new ArrayList<>();
+    public void drain(Consumer<EventJournalMapEvent<K, V>> consumer) {
         for (int i = 0; i < partitionCount; i++) {
-            ICompletableFuture<ReadResultSet<EventJournalMapEvent<K, V>>> f = proxy.readFromEventJournal(
-                    offsets[i], 0, POLL_COUNT, i, null, null);
-            futureList.add(f);
+            readFromJournal(0, i, consumer);
         }
-        for (int i = 0; i < partitionCount; i++) {
-            ICompletableFuture<ReadResultSet<EventJournalMapEvent<K, V>>> future = futureList.get(i);
-            ReadResultSet<EventJournalMapEvent<K, V>> resultSet = future.get();
-            resultSet.forEach(consumer);
-            offsets[i] = offsets[i] + resultSet.readCount();
-            isEmpty = isEmpty & resultSet.readCount() == 0;
-        }
-        return isEmpty;
     }
 
+    private void readFromJournal(long seq, int pid,
+                                 Consumer<EventJournalMapEvent<K, V>> consumer
+    ) {
+        proxy.<EventJournalMapEvent<K, V>>readFromEventJournal(
+                seq, 1, POLL_COUNT, pid, null, null
+        ).andThen(new ExecutionCallback<ReadResultSet<EventJournalMapEvent<K, V>>>() {
+            @Override
+            public void onResponse(ReadResultSet<EventJournalMapEvent<K, V>> response) {
+                readFromJournal(response.getNextSequenceToReadFrom(), pid, consumer);
+                try {
+                    response.forEach(consumer);
+                } catch (Throwable t) {
+                    failure.set(t);
+                }
+                long prevSequence = seq;
+                long lostCount = response.getNextSequenceToReadFrom() - response.readCount() - prevSequence;
+                if (lostCount > 0) {
+                    System.out.println(lostCount + " events lost for partition "
+                            + pid + " due to journal overflow when reading from event journal."
+                            + " Increase journal size to avoid this error. nextSequenceToReadFrom="
+                            + response.getNextSequenceToReadFrom() + ", readCount=" + response.readCount()
+                            + ", prevSeq=" + prevSequence);
+                }
+            }
+            @Override
+            public void onFailure(Throwable t) {
+                Throwable peeled = ExceptionUtil.peel(t);
+                if (peeled instanceof OperationTimeoutException) {
+                    readFromJournal(seq, pid, consumer);
+                    return;
+                }
+                t.printStackTrace();
+                failure.set(t);
+            }
+        });
+    }
 
 }

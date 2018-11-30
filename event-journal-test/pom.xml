@@ -99,7 +99,78 @@
                     </execution>
                 </executions>
             </plugin>
+            <plugin>
+                <artifactId>maven-assembly-plugin</artifactId>
+                <version>3.1.0</version>
+                <configuration>
+                    <finalName>event-journal-test</finalName>
+                    <descriptorRefs>
+                        <descriptorRef>jar-with-dependencies</descriptorRef>
+                    </descriptorRefs>
+                    <archive>
+                        <manifest>
+                            <mainClass>jet.com.hazelcast.tests.eventjournal.EventJournalTest</mainClass>
+                        </manifest>
+                    </archive>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>make-assembly</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>single</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
         </plugins>
     </build>
 
+    <profiles>
+        <profile>
+            <!--
+            ~ Jib builds Docker and OCI images for Java applications. It is available as
+            ~ plugins for Maven and Gradle and as a Java library. For more
+            ~ information about Jib check out official Github repository at
+            ~ https://github.com/GoogleContainerTools/jib
+            -->
+            <id>jib</id>
+            <dependencies>
+                <dependency>
+                    <groupId>com.hazelcast</groupId>
+                    <artifactId>hazelcast-kubernetes</artifactId>
+                    <version>1.2.2</version>
+                </dependency>
+            </dependencies>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>com.google.cloud.tools</groupId>
+                        <artifactId>jib-maven-plugin</artifactId>
+                        <version>0.9.11</version>
+                        <configuration>
+                            <to>
+                                <image>gcr.io/hazelcast-33/event-journal-test</image>
+                            </to>
+                            <extraDirectory>${project.build.directory}</extraDirectory>
+                            <container>
+                                <mainClass>com.hazelcast.jet.server.JetBootstrap</mainClass>
+                                <args>
+                                    <arg>event-journal-test-jar-with-dependencies.jar</arg>
+                                </args>
+                            </container>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <phase>package</phase>
+                                <goals>
+                                    <goal>build</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

@@ -26,9 +26,11 @@ import com.hazelcast.jet.aggregate.AggregateOperations;
 import com.hazelcast.jet.config.JobConfig;
 import com.hazelcast.jet.config.ProcessingGuarantee;
 import com.hazelcast.jet.core.JobStatus;
+import com.hazelcast.jet.datamodel.TimestampedEntry;
 import com.hazelcast.jet.pipeline.Pipeline;
 import com.hazelcast.jet.pipeline.Sinks;
 import com.hazelcast.jet.pipeline.Sources;
+import com.hazelcast.jet.pipeline.StreamStage;
 import com.hazelcast.jet.server.JetBootstrap;
 import com.hazelcast.logging.LoggingService;
 import com.hazelcast.map.journal.EventJournalMapEvent;
@@ -43,6 +45,7 @@ import tests.eventjournal.EventJournalTradeProducer;
 import tests.snapshot.QueueVerifier;
 
 import java.io.Serializable;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static com.hazelcast.jet.core.JobStatus.COMPLETED;
 import static com.hazelcast.jet.core.JobStatus.FAILED;
@@ -55,6 +58,7 @@ import static java.util.concurrent.TimeUnit.MINUTES;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNull;
 
 @RunWith(JUnit4.class)
 public class EventJournalTest implements Serializable {
@@ -71,6 +75,7 @@ public class EventJournalTest implements Serializable {
     private int partitionCount;
     private int memberSize;
     private EventJournalTradeProducer tradeProducer;
+    private Job job;
 
     public static void main(String[] args) {
         JUnitCore.main(EventJournalTest.class.getName());
@@ -95,10 +100,10 @@ public class EventJournalTest implements Serializable {
         partitionCount = jet.getHazelcastInstance().getPartitionService().getPartitions().size();
         Config config = jet.getHazelcastInstance().getConfig();
         config.addEventJournalConfig(
-                new EventJournalConfig().setMapName(MAP_NAME).setCapacity(1_000_000)
+                new EventJournalConfig().setMapName(MAP_NAME).setCapacity(5_000_000)
         );
         config.addEventJournalConfig(
-                new EventJournalConfig().setMapName(RESULTS_MAP_NAME).setCapacity(20_000)
+                new EventJournalConfig().setMapName(RESULTS_MAP_NAME).setCapacity(50_000)
         );
         tradeProducer = new EventJournalTradeProducer(countPerTicker, jet.getMap(MAP_NAME), timestampPerSecond);
     }
@@ -109,7 +114,11 @@ public class EventJournalTest implements Serializable {
         jobConfig.setName("EventJournalTest");
         jobConfig.setSnapshotIntervalMillis(snapshotIntervalMs);
         jobConfig.setProcessingGuarantee(ProcessingGuarantee.EXACTLY_ONCE);
-        Job job = jet.newJob(pipeline(), jobConfig);
+        jobConfig.addClass(EventJournalTest.class);
+        jobConfig.addClass(EventJournalTradeProducer.class);
+        jobConfig.addClass(EventJournalConsumer.class);
+        jobConfig.addClass(QueueVerifier.class);
+        job = jet.newJob(pipeline(), jobConfig);
         tradeProducer.start();
 
         int windowCount = windowSize / slideBy;
@@ -118,18 +127,18 @@ public class EventJournalTest implements Serializable {
                 "Verifier[" + RESULTS_MAP_NAME + "]", windowCount).startVerification();
 
         ClientMapProxy<Long, Long> resultMap = (ClientMapProxy) jet.getHazelcastInstance().getMap(RESULTS_MAP_NAME);
-        EventJournalConsumer<Long, Long> consumer = new EventJournalConsumer<>(resultMap, partitionCount);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        EventJournalConsumer<Long, Long> consumer = new EventJournalConsumer<>(resultMap, partitionCount, failure);
+        consumer.drain(e -> {
+            System.out.println("Read result event = ( " + e.getKey() + ", " + e.getNewValue() + " )");
+            assertEquals("EXACTLY_ONCE -> Unexpected count for " + e.getKey(),
+                    countPerTicker, (long) e.getNewValue());
+            queueVerifier.offer(e.getKey());
+        });
 
         long begin = System.currentTimeMillis();
         while (System.currentTimeMillis() - begin < durationInMillis) {
-            boolean isEmpty = consumer.drain(e -> {
-                assertEquals("EXACTLY_ONCE -> Unexpected count for " + e.getKey(),
-                        countPerTicker, (long) e.getNewValue());
-                queueVerifier.offer(e.getKey());
-            });
-            if (isEmpty) {
-                SECONDS.sleep(1);
-            }
+            assertNull(failure.get());
             assertNotEquals(getJobStatus(job), FAILED);
         }
         System.out.println("Cancelling jobs..");
@@ -144,6 +153,9 @@ public class EventJournalTest implements Serializable {
 
     @After
     public void teardown() throws Exception {
+        if (job != null) {
+            job.cancel();
+        }
         if (tradeProducer != null) {
             tradeProducer.close();
         }
@@ -154,15 +166,16 @@ public class EventJournalTest implements Serializable {
 
     private Pipeline pipeline() {
         Pipeline pipeline = Pipeline.create();
-
-        pipeline.drawFrom(Sources.<Long, Long, Long>mapJournal(MAP_NAME, e -> e.getType() == EntryEventType.ADDED,
-                EventJournalMapEvent::getNewValue, START_FROM_OLDEST))
+        StreamStage<TimestampedEntry<Long, Long>> stage = pipeline
+                .drawFrom(Sources.<Long, Long, Long>mapJournal(MAP_NAME, e -> e.getType() == EntryEventType.ADDED,
+                        EventJournalMapEvent::getNewValue, START_FROM_OLDEST))
                 .setLocalParallelism(partitionCount / memberSize)
                 .addTimestamps(t -> t, lagMs).setName("Read from map(" + MAP_NAME + ")")
                 .window(sliding(windowSize, slideBy))
                 .groupingKey(wholeItem())
-                .aggregate(AggregateOperations.counting()).setName("Aggregate(count)")
-                .drainTo(Sinks.map(RESULTS_MAP_NAME)).setName("Write to map(" + RESULTS_MAP_NAME + ")");
+                .aggregate(AggregateOperations.counting()).setName("Aggregate(count)");
+        stage.drainTo(Sinks.map(RESULTS_MAP_NAME)).setName("Write to map(" + RESULTS_MAP_NAME + ")");
+        stage.drainTo(Sinks.logger());
         return pipeline;
     }
 
